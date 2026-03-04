@@ -73,9 +73,18 @@ const WINS_TO_WIN = 7;
 const ROUNDS_TO_WIN_MATCH = 3;
 const GOAL_CELEBRATE_MS = 2200;
 
+// ─── Perspective Constants ────────────────────────────────────────────────────
+// Camera at bottom of screen, looking up the rink (Y axis becomes depth)
+// Near edge = physics Y = RINK_MARGIN_Y (top of screen in top-down) → renders at SCREEN_NEAR_Y
+// Far edge = physics Y = RINK_MARGIN_Y + RINK_H → renders at HORIZON_Y
+const HORIZON_Y = 130; // where far end of rink converges (screen pixels)
+const SCREEN_NEAR_Y = 530; // where near edge of rink is drawn (screen pixels)
+const SCREEN_NEAR_HALF_W = 410; // half-width of rink at near edge (screen pixels)
+const PERSPECTIVE_DEPTH = 3.2; // how strong the perspective squeeze is
+const _RINK_W_SCREEN = SCREEN_NEAR_HALF_W * 2; // full screen width at near edge
+
 // Ice colors (literal values required for Canvas API)
 const ICE_DARK = "#060e22";
-const _ICE_MID = "#091528";
 const ICE_LINE_CENTER = "#cc2222";
 const ICE_LINE_BLUE = "#2244cc";
 const ICE_LINE_WHITE = "rgba(255,255,255,0.55)";
@@ -84,10 +93,40 @@ const P1_COLOR = "#ff3a2d";
 const P1_GLOW = "rgba(255, 58, 45, 0.6)";
 const P2_COLOR = "#3d7fff";
 const P2_GLOW = "rgba(61, 127, 255, 0.6)";
-const _PUCK_COLOR = "#fffff0";
 const PUCK_GLOW = "rgba(255, 255, 220, 0.7)";
 const GOAL_COLOR_LEFT = "rgba(255, 58, 45, 0.35)";
 const GOAL_COLOR_RIGHT = "rgba(61, 127, 255, 0.35)";
+
+// ─── Perspective Projection ───────────────────────────────────────────────────
+// Converts ice physics coordinates to screen (sx, sy, scale)
+// iceX: full range 0..CANVAS_W, iceY: full range 0..CANVAS_H
+// We map the rink interior Y (RINK_MARGIN_Y .. RINK_MARGIN_Y+RINK_H) to depth
+// t=0 is near edge (low Y in physics = top of screen in top-down), t=1 is far
+
+function project(
+  iceX: number,
+  iceY: number,
+): { sx: number; sy: number; scale: number } {
+  // Normalize iceY within the rink range: 0 at near edge, 1 at far edge
+  // In original top-down view, near=RINK_MARGIN_Y, far=RINK_MARGIN_Y+RINK_H
+  const t = (iceY - RINK_MARGIN_Y) / RINK_H;
+  const tClamped = Math.max(0, Math.min(1, t));
+
+  // Perspective scale: squishes as t→1
+  const perspectiveFactor = 1 / (1 + tClamped * PERSPECTIVE_DEPTH);
+
+  // Screen Y: near edge at SCREEN_NEAR_Y, far edge at HORIZON_Y
+  const sy = SCREEN_NEAR_Y - (SCREEN_NEAR_Y - HORIZON_Y) * tClamped;
+
+  // Screen X: converges from full rink width at near to tiny at vanishing point
+  // Normalize iceX within rink: centerX at 0, left wall at -0.5, right wall at +0.5
+  const iceRinkCenterX = RINK_MARGIN_X + RINK_W / 2;
+  const normalizedX = (iceX - iceRinkCenterX) / RINK_W; // -0.5 to +0.5
+  const screenHalfW = SCREEN_NEAR_HALF_W * perspectiveFactor;
+  const sx = CANVAS_W / 2 + normalizedX * screenHalfW * 2;
+
+  return { sx, sy, scale: perspectiveFactor };
+}
 
 // ─── Audio ────────────────────────────────────────────────────────────────────
 
@@ -199,285 +238,546 @@ function elasticCollision(
   };
 }
 
-// ─── Canvas Renderer ──────────────────────────────────────────────────────────
+// ─── Perspective Canvas Renderer ──────────────────────────────────────────────
+
+// Draw a horizontal line in ice space at a given iceY, spanning full rink width
+function drawPerspectiveLine(
+  ctx: CanvasRenderingContext2D,
+  iceY: number,
+  color: string,
+  lineWidth: number,
+  shadowColor?: string,
+  shadowBlur = 0,
+) {
+  const left = project(RINK_MARGIN_X, iceY);
+  const right = project(RINK_MARGIN_X + RINK_W, iceY);
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  if (shadowColor) {
+    ctx.shadowColor = shadowColor;
+    ctx.shadowBlur = shadowBlur;
+  }
+  ctx.beginPath();
+  ctx.moveTo(left.sx, left.sy);
+  ctx.lineTo(right.sx, right.sy);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Draw a perspective ellipse (circle in ice space projected to screen)
+function drawPerspectiveCircle(
+  ctx: CanvasRenderingContext2D,
+  iceCx: number,
+  iceCy: number,
+  iceRadius: number,
+  color: string,
+  lineWidth: number,
+  filled = false,
+  fillColor = "",
+) {
+  const STEPS = 48;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.beginPath();
+  for (let i = 0; i <= STEPS; i++) {
+    const angle = (i / STEPS) * Math.PI * 2;
+    const ix = iceCx + Math.cos(angle) * iceRadius;
+    const iy = iceCy + Math.sin(angle) * iceRadius;
+    const { sx, sy } = project(ix, iy);
+    if (i === 0) ctx.moveTo(sx, sy);
+    else ctx.lineTo(sx, sy);
+  }
+  ctx.closePath();
+  if (filled) {
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+  }
+  ctx.stroke();
+  ctx.restore();
+}
 
 function drawRink(ctx: CanvasRenderingContext2D) {
-  const mx = RINK_MARGIN_X;
-  const my = RINK_MARGIN_Y;
-  const rw = RINK_W;
-  const rh = RINK_H;
-  const cx = mx + rw / 2;
-  const cy = my + rh / 2;
-  const cornerR = 45;
+  // ── Arena background / bleachers above horizon ──────────────────────────
+  const bgGrad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+  bgGrad.addColorStop(0, "#080d1c");
+  bgGrad.addColorStop(0.3, "#0a1228");
+  bgGrad.addColorStop(1, "#04080f");
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
-  // Ice surface
-  const iceGrad = ctx.createRadialGradient(cx, cy, 60, cx, cy, 400);
-  iceGrad.addColorStop(0, "#0d1a30");
-  iceGrad.addColorStop(1, ICE_DARK);
+  // Crowd area above horizon
+  ctx.save();
+  ctx.fillStyle = "#0c1530";
+  ctx.fillRect(0, 0, CANVAS_W, HORIZON_Y + 10);
+
+  // Arena lights: big glow spots overhead
+  for (let i = 0; i < 5; i++) {
+    const lx = (CANVAS_W / 5) * i + CANVAS_W / 10;
+    const ly = 20;
+    const arenLight = ctx.createRadialGradient(lx, ly, 0, lx, ly, 80);
+    arenLight.addColorStop(0, "rgba(220, 240, 255, 0.18)");
+    arenLight.addColorStop(1, "transparent");
+    ctx.fillStyle = arenLight;
+    ctx.fillRect(lx - 80, 0, 160, 100);
+  }
+
+  // Crowd dots — subtle colored rows suggesting spectators
+  const crowdColors = [
+    "rgba(255,80,60,0.35)",
+    "rgba(60,120,255,0.35)",
+    "rgba(255,220,60,0.25)",
+    "rgba(200,200,200,0.2)",
+    "rgba(80,200,255,0.2)",
+  ];
+  for (let row = 0; row < 5; row++) {
+    const rowY = 18 + row * 16;
+    const dotCount = 48 - row * 4;
+    for (let col = 0; col < dotCount; col++) {
+      const dotX = (CANVAS_W / dotCount) * col + CANVAS_W / dotCount / 2;
+      // Vary x slightly for natural look
+      const jx = ((col * 7 + row * 13) % 9) - 4;
+      const jy = ((col * 3 + row * 5) % 5) - 2;
+      ctx.beginPath();
+      ctx.arc(dotX + jx, rowY + jy, 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = crowdColors[(col + row) % crowdColors.length];
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  // ── Ice surface trapezoid ─────────────────────────────────────────────────
+  const nearLeft = project(RINK_MARGIN_X, RINK_MARGIN_Y + RINK_H);
+  const nearRight = project(RINK_MARGIN_X + RINK_W, RINK_MARGIN_Y + RINK_H);
+  const farLeft = project(RINK_MARGIN_X, RINK_MARGIN_Y);
+  const farRight = project(RINK_MARGIN_X + RINK_W, RINK_MARGIN_Y);
 
   ctx.save();
   ctx.beginPath();
-  ctx.moveTo(mx + cornerR, my);
-  ctx.lineTo(mx + rw - cornerR, my);
-  ctx.quadraticCurveTo(mx + rw, my, mx + rw, my + cornerR);
-  ctx.lineTo(mx + rw, my + rh - cornerR);
-  ctx.quadraticCurveTo(mx + rw, my + rh, mx + rw - cornerR, my + rh);
-  ctx.lineTo(mx + cornerR, my + rh);
-  ctx.quadraticCurveTo(mx, my + rh, mx, my + rh - cornerR);
-  ctx.lineTo(mx, my + cornerR);
-  ctx.quadraticCurveTo(mx, my, mx + cornerR, my);
+  ctx.moveTo(nearLeft.sx, nearLeft.sy);
+  ctx.lineTo(nearRight.sx, nearRight.sy);
+  ctx.lineTo(farRight.sx, farRight.sy);
+  ctx.lineTo(farLeft.sx, farLeft.sy);
   ctx.closePath();
+
+  // Ice gradient: bright near camera, darker at far end
+  const iceGrad = ctx.createLinearGradient(
+    CANVAS_W / 2,
+    SCREEN_NEAR_Y,
+    CANVAS_W / 2,
+    HORIZON_Y,
+  );
+  iceGrad.addColorStop(0, "#0e1d3a");
+  iceGrad.addColorStop(0.4, "#0b1730");
+  iceGrad.addColorStop(0.8, "#091225");
+  iceGrad.addColorStop(1, ICE_DARK);
   ctx.fillStyle = iceGrad;
   ctx.fill();
 
-  // Rink border (neon glow)
+  // Rink border neon glow
   ctx.strokeStyle = NEON_CYAN;
   ctx.lineWidth = 2;
   ctx.shadowColor = NEON_CYAN;
-  ctx.shadowBlur = 10;
+  ctx.shadowBlur = 12;
   ctx.stroke();
   ctx.shadowBlur = 0;
   ctx.restore();
 
-  // Center red line
-  ctx.save();
-  ctx.strokeStyle = ICE_LINE_CENTER;
-  ctx.lineWidth = 3;
-  ctx.shadowColor = ICE_LINE_CENTER;
-  ctx.shadowBlur = 6;
-  ctx.beginPath();
-  ctx.moveTo(cx, my);
-  ctx.lineTo(cx, my + rh);
-  ctx.stroke();
-  ctx.shadowBlur = 0;
-  ctx.restore();
-
-  // Blue lines
-  const blueOffset = rw * 0.22;
-  for (const bx of [cx - blueOffset, cx + blueOffset]) {
+  // ── Ice shine lines (subtle horizontal glint) ─────────────────────────────
+  const shineYPositions = [0.2, 0.45, 0.68, 0.85];
+  for (const t of shineYPositions) {
+    const iceY = RINK_MARGIN_Y + t * RINK_H;
+    const lp = project(RINK_MARGIN_X + RINK_W * 0.1, iceY);
+    const rp = project(RINK_MARGIN_X + RINK_W * 0.9, iceY);
+    const shineGrad = ctx.createLinearGradient(lp.sx, lp.sy, rp.sx, rp.sy);
+    shineGrad.addColorStop(0, "transparent");
+    shineGrad.addColorStop(0.3, `rgba(180,220,255,${0.04 * (1 - t)})`);
+    shineGrad.addColorStop(0.5, `rgba(200,235,255,${0.08 * (1 - t)})`);
+    shineGrad.addColorStop(0.7, `rgba(180,220,255,${0.04 * (1 - t)})`);
+    shineGrad.addColorStop(1, "transparent");
     ctx.save();
-    ctx.strokeStyle = ICE_LINE_BLUE;
-    ctx.lineWidth = 3;
-    ctx.shadowColor = ICE_LINE_BLUE;
-    ctx.shadowBlur = 6;
+    ctx.strokeStyle = shineGrad;
+    ctx.lineWidth = Math.max(1, 3 * (1 - t));
     ctx.beginPath();
-    ctx.moveTo(bx, my);
-    ctx.lineTo(bx, my + rh);
+    ctx.moveTo(lp.sx, lp.sy);
+    ctx.lineTo(rp.sx, rp.sy);
     ctx.stroke();
-    ctx.shadowBlur = 0;
     ctx.restore();
   }
 
-  // Center circle
+  // ── Side boards (perspective walls) ──────────────────────────────────────
+  // Left board wall: from near-left to far-left, with depth
+  const boardH = 18; // visual board height in pixels
   ctx.save();
-  ctx.strokeStyle = ICE_LINE_CENTER;
-  ctx.lineWidth = 2;
+  // Left board face
+  ctx.beginPath();
+  ctx.moveTo(nearLeft.sx, nearLeft.sy);
+  ctx.lineTo(nearLeft.sx, nearLeft.sy - boardH);
+  ctx.lineTo(farLeft.sx, farLeft.sy - 4);
+  ctx.lineTo(farLeft.sx, farLeft.sy);
+  ctx.closePath();
+  const lBoardGrad = ctx.createLinearGradient(
+    nearLeft.sx,
+    nearLeft.sy,
+    farLeft.sx,
+    farLeft.sy,
+  );
+  lBoardGrad.addColorStop(0, "rgba(0, 229, 255, 0.25)");
+  lBoardGrad.addColorStop(1, "rgba(0, 229, 255, 0.08)");
+  ctx.fillStyle = lBoardGrad;
+  ctx.fill();
+  ctx.strokeStyle = NEON_CYAN;
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = NEON_CYAN;
+  ctx.shadowBlur = 8;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // Right board face
+  ctx.beginPath();
+  ctx.moveTo(nearRight.sx, nearRight.sy);
+  ctx.lineTo(nearRight.sx, nearRight.sy - boardH);
+  ctx.lineTo(farRight.sx, farRight.sy - 4);
+  ctx.lineTo(farRight.sx, farRight.sy);
+  ctx.closePath();
+  const rBoardGrad = ctx.createLinearGradient(
+    nearRight.sx,
+    nearRight.sy,
+    farRight.sx,
+    farRight.sy,
+  );
+  rBoardGrad.addColorStop(0, "rgba(0, 229, 255, 0.25)");
+  rBoardGrad.addColorStop(1, "rgba(0, 229, 255, 0.08)");
+  ctx.fillStyle = rBoardGrad;
+  ctx.fill();
+  ctx.strokeStyle = NEON_CYAN;
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = NEON_CYAN;
+  ctx.shadowBlur = 8;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  // ── Center red line ───────────────────────────────────────────────────────
+  const centerY = RINK_MARGIN_Y + RINK_H / 2;
+  drawPerspectiveLine(ctx, centerY, ICE_LINE_CENTER, 3, ICE_LINE_CENTER, 6);
+
+  // ── Blue lines ────────────────────────────────────────────────────────────
+  const blueOffset = RINK_H * 0.22;
+  drawPerspectiveLine(
+    ctx,
+    centerY - blueOffset,
+    ICE_LINE_BLUE,
+    3,
+    ICE_LINE_BLUE,
+    6,
+  );
+  drawPerspectiveLine(
+    ctx,
+    centerY + blueOffset,
+    ICE_LINE_BLUE,
+    3,
+    ICE_LINE_BLUE,
+    6,
+  );
+
+  // ── Goal lines ────────────────────────────────────────────────────────────
+  drawPerspectiveLine(ctx, RINK_MARGIN_Y + RINK_H * 0.08, ICE_LINE_WHITE, 2);
+  drawPerspectiveLine(ctx, RINK_MARGIN_Y + RINK_H * 0.92, ICE_LINE_WHITE, 2);
+
+  // ── Center circle ─────────────────────────────────────────────────────────
+  const iceCenterX = RINK_MARGIN_X + RINK_W / 2;
+  const iceCenterY = RINK_MARGIN_Y + RINK_H / 2;
+  // Circle radius in ice pixels: 65 pixels (same as original)
+  drawPerspectiveCircle(ctx, iceCenterX, iceCenterY, 65, ICE_LINE_CENTER, 2);
+
+  // Center dot
+  const centerDot = project(iceCenterX, iceCenterY);
+  ctx.save();
+  ctx.fillStyle = ICE_LINE_CENTER;
   ctx.shadowColor = ICE_LINE_CENTER;
   ctx.shadowBlur = 4;
   ctx.beginPath();
-  ctx.arc(cx, cy, 65, 0, Math.PI * 2);
-  ctx.stroke();
-  // Center dot
-  ctx.fillStyle = ICE_LINE_CENTER;
-  ctx.beginPath();
-  ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+  ctx.arc(centerDot.sx, centerDot.sy, 5 * centerDot.scale, 0, Math.PI * 2);
   ctx.fill();
   ctx.shadowBlur = 0;
   ctx.restore();
 
-  // Face-off circles (4 corners)
-  const foX = blueOffset * 0.55;
-  const foY = rh * 0.28;
+  // ── Face-off circles ─────────────────────────────────────────────────────
+  const foX2 = RINK_W * 0.22 * 0.55;
+  const foY2 = RINK_H * 0.28;
   const faceOffPositions = [
-    { x: cx - foX, y: cy - foY },
-    { x: cx - foX, y: cy + foY },
-    { x: cx + foX, y: cy - foY },
-    { x: cx + foX, y: cy + foY },
+    { x: iceCenterX - foX2, y: iceCenterY - foY2 },
+    { x: iceCenterX - foX2, y: iceCenterY + foY2 },
+    { x: iceCenterX + foX2, y: iceCenterY - foY2 },
+    { x: iceCenterX + foX2, y: iceCenterY + foY2 },
   ];
   for (const { x, y } of faceOffPositions) {
+    drawPerspectiveCircle(ctx, x, y, 30, "rgba(200, 30, 30, 0.5)", 1.5);
+    const dot = project(x, y);
     ctx.save();
-    ctx.strokeStyle = "rgba(200, 30, 30, 0.5)";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.arc(x, y, 30, 0, Math.PI * 2);
-    ctx.stroke();
     ctx.fillStyle = "rgba(200, 30, 30, 0.3)";
     ctx.beginPath();
-    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.arc(dot.sx, dot.sy, 4 * dot.scale, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
 
-  // Goal creases
-  const creaseW = 50;
-  const creaseH = GOAL_H + 20;
-  const creaseY = cy - creaseH / 2;
-
-  // Left crease
-  ctx.save();
-  ctx.fillStyle = "rgba(255, 58, 45, 0.12)";
-  ctx.strokeStyle = ICE_LINE_WHITE;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.arc(mx + creaseW / 2, cy, creaseH / 2, -Math.PI / 2, Math.PI / 2);
-  ctx.lineTo(mx, creaseY + creaseH);
-  ctx.lineTo(mx, creaseY);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-  ctx.restore();
+  // ── Goal creases ──────────────────────────────────────────────────────────
+  // Left goal crease (arc + fill)
+  const creaseRadius = 70;
+  // Left crease (near left wall, around goal center)
+  const leftGoalCenterX = RINK_MARGIN_X;
+  const leftGoalCenterY = iceCenterY;
+  drawPerspectiveCrease(
+    ctx,
+    leftGoalCenterX,
+    leftGoalCenterY,
+    creaseRadius,
+    "left",
+  );
 
   // Right crease
+  const rightGoalCenterX = RINK_MARGIN_X + RINK_W;
+  const rightGoalCenterY = iceCenterY;
+  drawPerspectiveCrease(
+    ctx,
+    rightGoalCenterX,
+    rightGoalCenterY,
+    creaseRadius,
+    "right",
+  );
+
+  // ── Goal nets ─────────────────────────────────────────────────────────────
+  drawPerspectiveGoal(ctx, RINK_MARGIN_X, iceCenterY, "left", P1_COLOR);
+  drawPerspectiveGoal(
+    ctx,
+    RINK_MARGIN_X + RINK_W,
+    iceCenterY,
+    "right",
+    P2_COLOR,
+  );
+}
+
+function drawPerspectiveCrease(
+  ctx: CanvasRenderingContext2D,
+  goalX: number,
+  goalCenterY: number,
+  radius: number,
+  side: "left" | "right",
+) {
+  const halfGoal = GOAL_H / 2;
+  const startY = goalCenterY - halfGoal;
+  const endY = goalCenterY + halfGoal;
+
+  // Draw the crease as a series of lines from the goal line outward
+  const STEPS = 20;
+  const dir = side === "left" ? 1 : -1;
   ctx.save();
-  ctx.fillStyle = "rgba(61, 127, 255, 0.12)";
+  ctx.fillStyle =
+    side === "left" ? "rgba(255, 58, 45, 0.08)" : "rgba(61, 127, 255, 0.08)";
   ctx.strokeStyle = ICE_LINE_WHITE;
   ctx.lineWidth = 1.5;
+
   ctx.beginPath();
-  ctx.arc(mx + rw - creaseW / 2, cy, creaseH / 2, Math.PI / 2, -Math.PI / 2);
-  ctx.lineTo(mx + rw, creaseY);
-  ctx.lineTo(mx + rw, creaseY + creaseH);
+  // Bottom of crease at goal line
+  const ptBottom = project(goalX, endY);
+  ctx.moveTo(ptBottom.sx, ptBottom.sy);
+
+  // Arc around crease
+  for (let i = 0; i <= STEPS; i++) {
+    const angle = (i / STEPS) * Math.PI - Math.PI / 2;
+    const ix = goalX + dir * radius * Math.cos(angle);
+    const iy = goalCenterY + radius * Math.sin(angle);
+    const pt = project(ix, iy);
+    ctx.lineTo(pt.sx, pt.sy);
+  }
+  // Back to top goal line
+  const ptTop = project(goalX, startY);
+  ctx.lineTo(ptTop.sx, ptTop.sy);
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
   ctx.restore();
-
-  // Goal nets (left: red, right: blue)
-  drawGoalNet(ctx, mx, cy, "left", P1_COLOR);
-  drawGoalNet(ctx, mx + rw, cy, "right", P2_COLOR);
 }
 
-function drawGoalNet(
+function drawPerspectiveGoal(
   ctx: CanvasRenderingContext2D,
-  x: number,
-  cy: number,
+  wallX: number,
+  goalCenterY: number,
   side: "left" | "right",
   color: string,
 ) {
-  const gy = cy - GOAL_H / 2;
-  const gh = GOAL_H;
-  const gd = GOAL_DEPTH;
+  const halfGoal = GOAL_H / 2;
+  const topPostY = goalCenterY - halfGoal;
+  const botPostY = goalCenterY + halfGoal;
   const dir = side === "left" ? -1 : 1;
+  const depthIce = GOAL_DEPTH * 1.5; // depth in ice X pixels
+
+  // Project the four corners of the goal face + back
+  const faceTopPost = project(wallX, topPostY);
+  const faceBotPost = project(wallX, botPostY);
+  const backTopPost = project(wallX + dir * depthIce, topPostY);
+  const backBotPost = project(wallX + dir * depthIce, botPostY);
 
   ctx.save();
-  // Goal back
-  ctx.fillStyle = side === "left" ? GOAL_COLOR_LEFT : GOAL_COLOR_RIGHT;
-  ctx.fillRect(side === "left" ? x - gd : x, gy, gd, gh);
 
-  // Net lines
+  // Goal back area (filled)
+  ctx.beginPath();
+  ctx.moveTo(faceTopPost.sx, faceTopPost.sy);
+  ctx.lineTo(faceBotPost.sx, faceBotPost.sy);
+  ctx.lineTo(backBotPost.sx, backBotPost.sy);
+  ctx.lineTo(backTopPost.sx, backTopPost.sy);
+  ctx.closePath();
+  ctx.fillStyle = side === "left" ? GOAL_COLOR_LEFT : GOAL_COLOR_RIGHT;
+  ctx.fill();
+
+  // Net grid lines (horizontal in Y direction)
+  const NET_H_LINES = 5;
+  const NET_V_LINES = 3;
+  ctx.globalAlpha = 0.5;
   ctx.strokeStyle = color;
   ctx.lineWidth = 1;
-  ctx.globalAlpha = 0.5;
-  // Vertical lines
-  for (let i = 0; i <= 4; i++) {
-    const nx = side === "left" ? x - gd + (i * gd) / 4 : x + (i * gd) / 4;
+
+  // Horizontal net lines (depth lines)
+  for (let i = 0; i <= NET_H_LINES; i++) {
+    const iy = topPostY + (i / NET_H_LINES) * GOAL_H;
+    const fp = project(wallX, iy);
+    const bp = project(wallX + dir * depthIce, iy);
     ctx.beginPath();
-    ctx.moveTo(nx, gy);
-    ctx.lineTo(nx, gy + gh);
+    ctx.moveTo(fp.sx, fp.sy);
+    ctx.lineTo(bp.sx, bp.sy);
     ctx.stroke();
   }
-  // Horizontal lines
-  for (let i = 0; i <= 6; i++) {
+
+  // Vertical net lines (parallel to goal face)
+  for (let i = 0; i <= NET_V_LINES; i++) {
+    const ix = wallX + dir * depthIce * (i / NET_V_LINES);
+    const tp = project(ix, topPostY);
+    const bp = project(ix, botPostY);
     ctx.beginPath();
-    const ny = gy + (i * gh) / 6;
-    const startX = side === "left" ? x - gd : x;
-    ctx.moveTo(startX, ny);
-    ctx.lineTo(startX + gd, ny);
+    ctx.moveTo(tp.sx, tp.sy);
+    ctx.lineTo(bp.sx, bp.sy);
     ctx.stroke();
   }
   ctx.globalAlpha = 1;
 
-  // Goal posts
+  // Goal posts outline (bright, with glow)
   ctx.strokeStyle = color;
   ctx.lineWidth = 3;
   ctx.shadowColor = color;
-  ctx.shadowBlur = 8;
+  ctx.shadowBlur = 10;
   ctx.beginPath();
-  ctx.moveTo(x, gy);
-  ctx.lineTo(x + dir * gd, gy);
-  ctx.lineTo(x + dir * gd, gy + gh);
-  ctx.lineTo(x, gy + gh);
+  ctx.moveTo(faceTopPost.sx, faceTopPost.sy);
+  ctx.lineTo(faceBotPost.sx, faceBotPost.sy);
+  ctx.lineTo(backBotPost.sx, backBotPost.sy);
+  ctx.lineTo(backTopPost.sx, backTopPost.sy);
+  ctx.lineTo(faceTopPost.sx, faceTopPost.sy);
+  ctx.stroke();
+  // Crossbar back
+  ctx.beginPath();
+  ctx.moveTo(backTopPost.sx, backTopPost.sy);
+  ctx.lineTo(backBotPost.sx, backBotPost.sy);
   ctx.stroke();
   ctx.shadowBlur = 0;
   ctx.restore();
 }
 
+// Draw a perspective-projected puck (flat ellipse on the ice)
 function drawPuck(ctx: CanvasRenderingContext2D, pos: Vec2, flashGoal = false) {
+  const { sx, sy, scale } = project(pos.x, pos.y);
+
+  // Puck width & height in screen space — flat on ice
+  const puckW = PUCK_R * 2.2 * scale;
+  const puckH = PUCK_R * 0.7 * scale;
+
   ctx.save();
-  // Glow layers
-  const glowColor = flashGoal ? "rgba(255, 200, 0, 0.9)" : PUCK_GLOW;
-  const glow = ctx.createRadialGradient(
-    pos.x,
-    pos.y,
+  // Shadow on ice below puck
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  ctx.beginPath();
+  ctx.ellipse(
+    sx,
+    sy + puckH * 0.5,
+    puckW * 0.9,
+    puckH * 0.4,
     0,
-    pos.x,
-    pos.y,
-    PUCK_R * 3,
+    0,
+    Math.PI * 2,
   );
+  ctx.fill();
+
+  // Glow layer
+  const glowColor = flashGoal ? "rgba(255, 200, 0, 0.9)" : PUCK_GLOW;
+  const glowR = PUCK_R * 3 * scale;
+  const glow = ctx.createRadialGradient(sx, sy, 0, sx, sy, glowR);
   glow.addColorStop(0, glowColor);
   glow.addColorStop(1, "transparent");
   ctx.fillStyle = glow;
   ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PUCK_R * 3, 0, Math.PI * 2);
+  ctx.ellipse(sx, sy, glowR, glowR * 0.5, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Shadow
+  // Puck body (flat ellipse)
   ctx.shadowColor = flashGoal ? "rgba(255,220,0,0.9)" : PUCK_GLOW;
-  ctx.shadowBlur = 20;
+  ctx.shadowBlur = 15 * scale;
 
-  // Puck body
   const grad = ctx.createRadialGradient(
-    pos.x - 3,
-    pos.y - 3,
-    1,
-    pos.x,
-    pos.y,
-    PUCK_R,
+    sx - puckW * 0.2,
+    sy - puckH * 0.2,
+    puckH * 0.1,
+    sx,
+    sy,
+    puckW,
   );
   grad.addColorStop(0, "#ffffff");
   grad.addColorStop(0.5, flashGoal ? "#ffe000" : "#ffffcc");
   grad.addColorStop(1, flashGoal ? "#ff8800" : "#cccc88");
   ctx.fillStyle = grad;
   ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PUCK_R, 0, Math.PI * 2);
+  ctx.ellipse(sx, sy, puckW, puckH, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 }
 
-function drawPaddleCircleFallback(
+// Fallback player rendering (no sprite)
+function drawPlayerFallback(
   ctx: CanvasRenderingContext2D,
-  pos: Vec2,
+  sx: number,
+  sy: number,
+  scale: number,
   color: string,
   glowColor: string,
   label: string,
 ) {
+  const r = PADDLE_R * scale;
   ctx.save();
-  // Outer glow
+  // Glow
   const glow = ctx.createRadialGradient(
-    pos.x,
-    pos.y,
-    PADDLE_R * 0.3,
-    pos.x,
-    pos.y,
-    PADDLE_R * 2.2,
+    sx,
+    sy - r,
+    r * 0.2,
+    sx,
+    sy - r,
+    r * 2.5,
   );
   glow.addColorStop(0, glowColor);
   glow.addColorStop(1, "transparent");
   ctx.fillStyle = glow;
   ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PADDLE_R * 2.2, 0, Math.PI * 2);
+  ctx.arc(sx, sy - r, r * 2.5, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.shadowColor = glowColor;
   ctx.shadowBlur = 18;
 
-  // Paddle body gradient
   const grad = ctx.createRadialGradient(
-    pos.x - 6,
-    pos.y - 6,
-    2,
-    pos.x,
-    pos.y,
-    PADDLE_R,
+    sx - r * 0.3,
+    sy - r * 1.3,
+    r * 0.2,
+    sx,
+    sy - r,
+    r,
   );
   grad.addColorStop(0, color === P1_COLOR ? "#ff7a72" : "#7ab0ff");
   grad.addColorStop(0.5, color);
@@ -485,75 +785,74 @@ function drawPaddleCircleFallback(
 
   ctx.fillStyle = grad;
   ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PADDLE_R, 0, Math.PI * 2);
+  ctx.arc(sx, sy - r, r, 0, Math.PI * 2);
   ctx.fill();
 
-  // Inner highlight ring
   ctx.strokeStyle = "rgba(255,255,255,0.4)";
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 1.5;
   ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PADDLE_R * 0.65, 0, Math.PI * 2);
+  ctx.arc(sx, sy - r, r * 0.65, 0, Math.PI * 2);
   ctx.stroke();
-
-  // Outer ring
-  ctx.strokeStyle = "rgba(255,255,255,0.25)";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PADDLE_R, 0, Math.PI * 2);
-  ctx.stroke();
-
   ctx.shadowBlur = 0;
 
-  // Label
   ctx.fillStyle = "rgba(255,255,255,0.9)";
-  ctx.font = "bold 14px 'Bricolage Grotesque', sans-serif";
+  ctx.font = `bold ${Math.max(10, 14 * scale)}px 'Bricolage Grotesque', sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(label, pos.x, pos.y);
+  ctx.fillText(label, sx, sy - r);
   ctx.restore();
 }
 
-// Sprite size drawn on canvas (visual, hitbox stays PADDLE_R circle)
-const SPRITE_SIZE = 72;
+// Sprite base sizes in screen pixels at scale=1
+const BASE_SPRITE_H = 110; // height at near edge (scale=1)
+const BASE_SPRITE_W = 90;
 
-function drawPaddle(
+function drawPlayer(
   ctx: CanvasRenderingContext2D,
   pos: Vec2,
   color: string,
   glowColor: string,
   label: string,
-  angle: number,
+  _angle: number,
   sprite: HTMLImageElement | null,
 ) {
-  // Glow aura (always drawn for visual punch)
+  const { sx, sy, scale } = project(pos.x, pos.y);
+
+  // Shadow ellipse on ice at feet
   ctx.save();
-  const glow = ctx.createRadialGradient(
-    pos.x,
-    pos.y,
-    PADDLE_R * 0.2,
-    pos.x,
-    pos.y,
-    PADDLE_R * 2.0,
-  );
-  glow.addColorStop(0, glowColor);
-  glow.addColorStop(1, "transparent");
-  ctx.fillStyle = glow;
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
   ctx.beginPath();
-  ctx.arc(pos.x, pos.y, PADDLE_R * 2.0, 0, Math.PI * 2);
+  ctx.ellipse(sx, sy, 28 * scale, 8 * scale, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Glow aura at feet level
+  ctx.save();
+  const auraGrad = ctx.createRadialGradient(
+    sx,
+    sy - 5 * scale,
+    0,
+    sx,
+    sy - 10 * scale,
+    60 * scale,
+  );
+  auraGrad.addColorStop(0, glowColor.replace("0.6)", "0.35)"));
+  auraGrad.addColorStop(1, "transparent");
+  ctx.fillStyle = auraGrad;
+  ctx.beginPath();
+  ctx.ellipse(sx, sy - 20 * scale, 60 * scale, 50 * scale, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 
   if (sprite?.complete && sprite.naturalWidth > 0) {
-    // Draw sprite rotated around its center
+    const sprH = BASE_SPRITE_H * scale;
+    const sprW = BASE_SPRITE_W * scale;
     ctx.save();
-    ctx.translate(pos.x, pos.y);
-    ctx.rotate(angle);
-    const half = SPRITE_SIZE / 2;
-    ctx.drawImage(sprite, -half, -half, SPRITE_SIZE, SPRITE_SIZE);
+    // Draw sprite with feet at sy, centered on sx
+    ctx.drawImage(sprite, sx - sprW / 2, sy - sprH, sprW, sprH);
     ctx.restore();
   } else {
-    // Fallback: colored circle
-    drawPaddleCircleFallback(ctx, pos, color, glowColor, label);
+    drawPlayerFallback(ctx, sx, sy, scale, color, glowColor, label);
   }
 }
 
@@ -1136,13 +1435,6 @@ export default function HockeyGame() {
       // ── Render ────────────────────────────────────────────────────────
       ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
 
-      // Background gradient
-      const bgGrad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
-      bgGrad.addColorStop(0, "#04080f");
-      bgGrad.addColorStop(1, "#060e1a");
-      ctx.fillStyle = bgGrad;
-      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-
       drawRink(ctx);
 
       // Goal flash overlay
@@ -1152,25 +1444,44 @@ export default function HockeyGame() {
         if (flashAlpha > 0) drawGoalFlash(ctx, gs.goalScorer, flashAlpha);
       }
 
-      drawPaddle(
-        ctx,
-        gs.p2,
-        P2_COLOR,
-        P2_GLOW,
-        "P2",
-        gs.p2Angle,
-        p2SpriteRef.current,
-      );
-      drawPaddle(
-        ctx,
-        gs.p1,
-        P1_COLOR,
-        P1_GLOW,
-        "P1",
-        gs.p1Angle,
-        p1SpriteRef.current,
-      );
-      drawPuck(ctx, gs.puck, phaseRef.current === "goal");
+      // Draw players and puck sorted by depth (farther = smaller Y = drawn first)
+      // Sort so nearer objects draw on top of farther ones
+      const drawables = [
+        {
+          y: gs.p2.y,
+          draw: () =>
+            drawPlayer(
+              ctx,
+              gs.p2,
+              P2_COLOR,
+              P2_GLOW,
+              "P2",
+              gs.p2Angle,
+              p2SpriteRef.current,
+            ),
+        },
+        {
+          y: gs.p1.y,
+          draw: () =>
+            drawPlayer(
+              ctx,
+              gs.p1,
+              P1_COLOR,
+              P1_GLOW,
+              "P1",
+              gs.p1Angle,
+              p1SpriteRef.current,
+            ),
+        },
+        {
+          y: gs.puck.y,
+          draw: () => drawPuck(ctx, gs.puck, phaseRef.current === "goal"),
+        },
+      ];
+      // Sort by iceY: lower Y = farther away = draw first
+      drawables.sort((a, b) => a.y - b.y);
+      for (const { draw } of drawables) draw();
+
       drawHUD(
         ctx,
         gs.score,
@@ -1304,28 +1615,45 @@ export default function HockeyGame() {
       if (!ctx) return;
 
       ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
-      const bgGrad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
-      bgGrad.addColorStop(0, "#04080f");
-      bgGrad.addColorStop(1, "#060e1a");
-      ctx.fillStyle = bgGrad;
-      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
       drawRink(ctx);
 
-      // Static paddles + puck preview
+      // Static players + puck preview
       const p1Pos = { x: RINK_MARGIN_X + 70, y: CANVAS_H / 2 };
       const p2Pos = { x: CANVAS_W - RINK_MARGIN_X - 70, y: CANVAS_H / 2 };
       const puck = { x: CANVAS_W / 2, y: CANVAS_H / 2 };
-      drawPaddle(
-        ctx,
-        p2Pos,
-        P2_COLOR,
-        P2_GLOW,
-        "P2",
-        Math.PI,
-        p2SpriteRef.current,
-      );
-      drawPaddle(ctx, p1Pos, P1_COLOR, P1_GLOW, "P1", 0, p1SpriteRef.current);
-      drawPuck(ctx, puck);
+
+      const startDrawables = [
+        {
+          y: p2Pos.y,
+          draw: () =>
+            drawPlayer(
+              ctx,
+              p2Pos,
+              P2_COLOR,
+              P2_GLOW,
+              "P2",
+              Math.PI,
+              p2SpriteRef.current,
+            ),
+        },
+        {
+          y: p1Pos.y,
+          draw: () =>
+            drawPlayer(
+              ctx,
+              p1Pos,
+              P1_COLOR,
+              P1_GLOW,
+              "P1",
+              0,
+              p1SpriteRef.current,
+            ),
+        },
+        { y: puck.y, draw: () => drawPuck(ctx, puck) },
+      ];
+      startDrawables.sort((a, b) => a.y - b.y);
+      for (const { draw } of startDrawables) draw();
+
       drawHUD(ctx, [0, 0], 0, null, [0, 0], 1);
     };
 
@@ -1363,7 +1691,7 @@ export default function HockeyGame() {
           height={CANVAS_H}
           tabIndex={0}
           data-ocid="game.canvas_target"
-          className="w-full rounded-lg outline-none scanlines relative"
+          className="w-full rounded-lg outline-none relative"
           style={{
             boxShadow:
               "0 0 40px oklch(0.85 0.18 195 / 0.2), 0 0 80px oklch(0.85 0.18 195 / 0.08), inset 0 0 0 1px oklch(0.85 0.18 195 / 0.15)",
