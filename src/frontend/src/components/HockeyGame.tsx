@@ -13,7 +13,20 @@ import React, { useRef, useEffect, useState, useCallback } from "react";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type GamePhase = "start" | "playing" | "goal" | "gameover";
+type GamePhase = "start" | "playing" | "goal" | "roundover" | "gameover";
+
+interface ConfettiParticle {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  rotation: number;
+  spin: number;
+  color: string;
+  life: number; // 0–1, decreases to 0
+  size: number;
+}
 
 interface Vec2 {
   x: number;
@@ -30,6 +43,7 @@ interface GameState {
   p1Angle: number;
   p2Angle: number;
   score: [number, number];
+  roundWins: [number, number];
   keys: Set<string>;
   lastTime: number;
   goalScorer: 1 | 2 | null;
@@ -56,6 +70,7 @@ const GOAL_H = 140;
 const GOAL_Y = RINK_MARGIN_Y + (RINK_H - GOAL_H) / 2;
 const GOAL_DEPTH = 30;
 const WINS_TO_WIN = 7;
+const ROUNDS_TO_WIN_MATCH = 3;
 const GOAL_CELEBRATE_MS = 2200;
 
 // Ice colors (literal values required for Canvas API)
@@ -572,6 +587,8 @@ function drawHUD(
   score: [number, number],
   goalFlash: number,
   goalScorer: 1 | 2 | null,
+  roundWins: [number, number] = [0, 0],
+  roundNum = 1,
 ) {
   // Score panel background
   const hudY = 8;
@@ -626,6 +643,40 @@ function drawHUD(
   ctx.fillText("P1  WASD", RINK_MARGIN_X + 4, 14);
   ctx.textAlign = "right";
   ctx.fillText("ARROWS  P2", CANVAS_W - RINK_MARGIN_X - 4, 14);
+
+  // Round indicator
+  ctx.font = "10px 'Mona Sans', sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.textAlign = "center";
+  ctx.fillText(`ROUND ${roundNum}`, CANVAS_W / 2, hudY + hudH + 12);
+
+  // Round win dots for P1 (left of center)
+  for (let i = 0; i < ROUNDS_TO_WIN_MATCH; i++) {
+    ctx.beginPath();
+    ctx.arc(
+      CANVAS_W / 2 - 55 + (i - 1) * 10,
+      hudY + hudH + 22,
+      3,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fillStyle = i < roundWins[0] ? P1_COLOR : "rgba(255,255,255,0.2)";
+    ctx.fill();
+  }
+  // Round win dots for P2 (right of center)
+  for (let i = 0; i < ROUNDS_TO_WIN_MATCH; i++) {
+    ctx.beginPath();
+    ctx.arc(
+      CANVAS_W / 2 + 55 + (i - 1) * 10,
+      hudY + hudH + 22,
+      3,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fillStyle = i < roundWins[1] ? P2_COLOR : "rgba(255,255,255,0.2)";
+    ctx.fill();
+  }
+
   ctx.restore();
 }
 
@@ -643,6 +694,7 @@ export default function HockeyGame() {
     p1Angle: 0, // P1 defaults facing right (0 rad)
     p2Angle: Math.PI, // P2 defaults facing left (π rad)
     score: [0, 0],
+    roundWins: [0, 0],
     keys: new Set(),
     lastTime: 0,
     goalScorer: null,
@@ -670,10 +722,23 @@ export default function HockeyGame() {
   const [phase, setPhase] = useState<GamePhase>("start");
   const [displayScore, setDisplayScore] = useState<[number, number]>([0, 0]);
   const [goalMessage, setGoalMessage] = useState<string>("");
+  const [goalScorer, setGoalScorerState] = useState<1 | 2 | null>(null);
   const [winner, setWinner] = useState<1 | 2 | null>(null);
   const [winnerName, setWinnerName] = useState("");
   const [submitted, setSubmitted] = useState(false);
+  const [roundNumber, setRoundNumber] = useState(1);
+  const [roundWins, setRoundWins] = useState<[number, number]>([0, 0]);
+  const [roundWinner, setRoundWinner] = useState<1 | 2 | null>(null);
   const phaseRef = useRef<GamePhase>("start");
+  const roundNumberRef = useRef(1);
+
+  // ── Goal effects state ────────────────────────────────────────────────────
+  const [confettiParticles, setConfettiParticles] = useState<
+    ConfettiParticle[]
+  >([]);
+  const [showFlash, setShowFlash] = useState(false);
+  const confettiRafRef = useRef<number>(0);
+  const confettiLastTimeRef = useRef<number>(0);
 
   const { data: topScores, refetch: refetchScores } = useTopScores();
   const addScore = useAddScore();
@@ -682,6 +747,89 @@ export default function HockeyGame() {
   useEffect(() => {
     phaseRef.current = phase;
   }, [phase]);
+
+  // Keep roundNumberRef in sync
+  useEffect(() => {
+    roundNumberRef.current = roundNumber;
+  }, [roundNumber]);
+
+  // ── Confetti animation loop ───────────────────────────────────────────────
+  const confettiLength = confettiParticles.length;
+  useEffect(() => {
+    if (confettiLength === 0) return;
+
+    confettiLastTimeRef.current = performance.now();
+
+    const animate = (now: number) => {
+      const dt = Math.min((now - confettiLastTimeRef.current) / 1000, 0.05);
+      confettiLastTimeRef.current = now;
+
+      setConfettiParticles((prev) => {
+        const updated = prev
+          .map((p) => ({
+            ...p,
+            x: p.x + p.vx * dt,
+            y: p.y + p.vy * dt,
+            vy: p.vy + 300 * dt, // gravity
+            vx: p.vx * 0.99,
+            rotation: p.rotation + p.spin * dt,
+            life: p.life - dt / 2.0, // ~2s total life
+          }))
+          .filter((p) => p.life > 0);
+
+        if (updated.length === 0) return [];
+        return updated;
+      });
+
+      confettiRafRef.current = requestAnimationFrame(animate);
+    };
+
+    confettiRafRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      cancelAnimationFrame(confettiRafRef.current);
+    };
+  }, [confettiLength]);
+
+  // ── Trigger goal effects ──────────────────────────────────────────────────
+  const triggerGoalEffects = useCallback((scorer: 1 | 2) => {
+    // Screen flash
+    setShowFlash(true);
+    setTimeout(() => setShowFlash(false), 600);
+
+    // Spawn confetti
+    const CONFETTI_COLORS = [
+      "#ff3a2d",
+      "#3d7fff",
+      "#ffe000",
+      "#00e5ff",
+      "#ff69b4",
+      "#7fff00",
+    ];
+    const cx = 450; // canvas center x (roughly)
+    const cy = 280; // canvas center y (roughly)
+
+    const particles: ConfettiParticle[] = Array.from({ length: 80 }, (_, i) => {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 150 + Math.random() * 400;
+      return {
+        id: i,
+        x: cx + (Math.random() - 0.5) * 60,
+        y: cy + (Math.random() - 0.5) * 60,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 150, // upward bias
+        rotation: Math.random() * 360,
+        spin: (Math.random() - 0.5) * 720,
+        color:
+          CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)],
+        life: 0.8 + Math.random() * 0.4, // stagger start times slightly
+        size: 6 + Math.random() * 6,
+      };
+    });
+
+    setConfettiParticles(particles);
+    setGoalScorerState(scorer);
+  }, []);
 
   const resetPuck = useCallback(() => {
     const gs = stateRef.current;
@@ -699,6 +847,7 @@ export default function HockeyGame() {
   const resetGame = useCallback(() => {
     const gs = stateRef.current;
     gs.score = [0, 0];
+    gs.roundWins = [0, 0];
     gs.p1 = { x: RINK_MARGIN_X + 70, y: CANVAS_H / 2 };
     gs.p2 = { x: CANVAS_W - RINK_MARGIN_X - 70, y: CANVAS_H / 2 };
     gs.p1Vel = { x: 0, y: 0 };
@@ -713,6 +862,9 @@ export default function HockeyGame() {
     setWinner(null);
     setWinnerName("");
     setSubmitted(false);
+    setRoundWins([0, 0]);
+    setRoundNumber(1);
+    setRoundWinner(null);
   }, [resetPuck]);
 
   // ── Game Loop ─────────────────────────────────────────────────────────────
@@ -872,14 +1024,30 @@ export default function HockeyGame() {
         gs.running = false;
         playGoal();
         setDisplayScore([...gs.score] as [number, number]);
-        setGoalMessage("GOAL — PLAYER 2!");
+        setGoalMessage("PLAYER 2");
         gs.goalScorer = 2;
+        triggerGoalEffects(2);
         const newScore: [number, number] = [...gs.score] as [number, number];
         if (newScore[1] >= WINS_TO_WIN) {
-          setTimeout(() => {
-            setWinner(2);
-            setPhase("gameover");
-          }, GOAL_CELEBRATE_MS);
+          // P2 wins this round
+          gs.roundWins[1] += 1;
+          const newRoundWins: [number, number] = [...gs.roundWins] as [
+            number,
+            number,
+          ];
+          if (newRoundWins[1] >= ROUNDS_TO_WIN_MATCH) {
+            setTimeout(() => {
+              setWinner(2);
+              setPhase("gameover");
+            }, GOAL_CELEBRATE_MS);
+          } else {
+            setTimeout(() => {
+              setRoundWins([...gs.roundWins] as [number, number]);
+              setRoundWinner(2);
+              setConfettiParticles([]);
+              setPhase("roundover");
+            }, GOAL_CELEBRATE_MS);
+          }
         } else {
           setPhase("goal");
           setTimeout(() => {
@@ -888,6 +1056,7 @@ export default function HockeyGame() {
             gs.p2 = { x: CANVAS_W - RINK_MARGIN_X - 70, y: CANVAS_H / 2 };
             gs.running = true;
             gs.lastTime = performance.now();
+            setConfettiParticles([]);
             setPhase("playing");
           }, GOAL_CELEBRATE_MS);
         }
@@ -897,14 +1066,30 @@ export default function HockeyGame() {
         gs.running = false;
         playGoal();
         setDisplayScore([...gs.score] as [number, number]);
-        setGoalMessage("GOAL — PLAYER 1!");
+        setGoalMessage("PLAYER 1");
         gs.goalScorer = 1;
+        triggerGoalEffects(1);
         const newScore: [number, number] = [...gs.score] as [number, number];
         if (newScore[0] >= WINS_TO_WIN) {
-          setTimeout(() => {
-            setWinner(1);
-            setPhase("gameover");
-          }, GOAL_CELEBRATE_MS);
+          // P1 wins this round
+          gs.roundWins[0] += 1;
+          const newRoundWins: [number, number] = [...gs.roundWins] as [
+            number,
+            number,
+          ];
+          if (newRoundWins[0] >= ROUNDS_TO_WIN_MATCH) {
+            setTimeout(() => {
+              setWinner(1);
+              setPhase("gameover");
+            }, GOAL_CELEBRATE_MS);
+          } else {
+            setTimeout(() => {
+              setRoundWins([...gs.roundWins] as [number, number]);
+              setRoundWinner(1);
+              setConfettiParticles([]);
+              setPhase("roundover");
+            }, GOAL_CELEBRATE_MS);
+          }
         } else {
           setPhase("goal");
           setTimeout(() => {
@@ -913,6 +1098,7 @@ export default function HockeyGame() {
             gs.p2 = { x: CANVAS_W - RINK_MARGIN_X - 70, y: CANVAS_H / 2 };
             gs.running = true;
             gs.lastTime = performance.now();
+            setConfettiParticles([]);
             setPhase("playing");
           }, GOAL_CELEBRATE_MS);
         }
@@ -985,12 +1171,47 @@ export default function HockeyGame() {
         p1SpriteRef.current,
       );
       drawPuck(ctx, gs.puck, phaseRef.current === "goal");
-      drawHUD(ctx, gs.score, gs.goalFlashTimer, gs.goalScorer);
+      drawHUD(
+        ctx,
+        gs.score,
+        gs.goalFlashTimer,
+        gs.goalScorer,
+        gs.roundWins,
+        roundNumberRef.current,
+      );
 
       gs.animFrameId = requestAnimationFrame(gameLoop);
     },
-    [resetPuck],
+    [resetPuck, triggerGoalEffects],
   );
+
+  // ── Start next round ──────────────────────────────────────────────────────
+
+  const startNextRound = useCallback(() => {
+    const gs = stateRef.current;
+    cancelAnimationFrame(gs.animFrameId);
+    gs.score = [0, 0];
+    gs.p1 = { x: RINK_MARGIN_X + 70, y: CANVAS_H / 2 };
+    gs.p2 = { x: CANVAS_W - RINK_MARGIN_X - 70, y: CANVAS_H / 2 };
+    gs.p1Vel = { x: 0, y: 0 };
+    gs.p2Vel = { x: 0, y: 0 };
+    gs.p1Angle = 0;
+    gs.p2Angle = Math.PI;
+    gs.goalScorer = null;
+    gs.goalFlashTimer = 0;
+    gs.keys = new Set();
+    resetPuck();
+    setDisplayScore([0, 0]);
+    setConfettiParticles([]);
+    setRoundNumber((prev) => prev + 1);
+    setRoundWinner(null);
+    gs.running = true;
+    gs.lastTime = performance.now();
+    setPhase("playing");
+    setTimeout(() => {
+      gs.animFrameId = requestAnimationFrame(gameLoop);
+    }, 0);
+  }, [resetPuck, gameLoop]);
 
   // ── Start game loop ───────────────────────────────────────────────────────
 
@@ -1105,6 +1326,7 @@ export default function HockeyGame() {
       );
       drawPaddle(ctx, p1Pos, P1_COLOR, P1_GLOW, "P1", 0, p1SpriteRef.current);
       drawPuck(ctx, puck);
+      drawHUD(ctx, [0, 0], 0, null, [0, 0], 1);
     };
 
     renderStartScreen();
@@ -1164,7 +1386,8 @@ export default function HockeyGame() {
                 className="text-sm font-body mt-1"
                 style={{ color: "rgba(255,255,255,0.5)" }}
               >
-                FIRST TO {WINS_TO_WIN} GOALS WINS
+                FIRST TO {WINS_TO_WIN} GOALS · BEST OF{" "}
+                {ROUNDS_TO_WIN_MATCH * 2 - 1} ROUNDS
               </p>
             </div>
 
@@ -1251,19 +1474,147 @@ export default function HockeyGame() {
           </div>
         )}
 
+        {/* ── SCREEN FLASH ── */}
+        <div
+          className="absolute inset-0 pointer-events-none rounded-lg"
+          style={{
+            background: "white",
+            opacity: showFlash ? 0.7 : 0,
+            transition: showFlash
+              ? "opacity 50ms ease-in"
+              : "opacity 500ms ease-out",
+            zIndex: 10,
+          }}
+        />
+
+        {/* ── CONFETTI ── */}
+        {confettiParticles.map((p) => (
+          <div
+            key={p.id}
+            className="absolute pointer-events-none"
+            style={{
+              left: `${(p.x / 900) * 100}%`,
+              top: `${(p.y / 560) * 100}%`,
+              width: `${p.size}px`,
+              height: `${p.size}px`,
+              backgroundColor: p.color,
+              transform: `rotate(${p.rotation}deg)`,
+              opacity: Math.min(1, p.life * 2),
+              borderRadius: p.id % 3 === 0 ? "50%" : "1px",
+              zIndex: 20,
+            }}
+          />
+        ))}
+
         {/* ── GOAL OVERLAY ── */}
         {phase === "goal" && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <>
+            <style>{`
+              @keyframes goalPop {
+                0%   { transform: scale(2.5); opacity: 0; }
+                15%  { transform: scale(0.9); opacity: 1; }
+                25%  { transform: scale(1.08); opacity: 1; }
+                35%  { transform: scale(0.97); opacity: 1; }
+                45%  { transform: scale(1.02); opacity: 1; }
+                55%  { transform: scale(1); opacity: 1; }
+                80%  { transform: scale(1); opacity: 1; }
+                100% { transform: scale(1.05); opacity: 0; }
+              }
+              @keyframes scorerSlideUp {
+                0%   { transform: translateY(20px); opacity: 0; }
+                30%  { transform: translateY(-4px); opacity: 1; }
+                50%  { transform: translateY(0px); opacity: 1; }
+                80%  { transform: translateY(0px); opacity: 1; }
+                100% { transform: translateY(-8px); opacity: 0; }
+              }
+            `}</style>
             <div
-              className="font-display font-black text-4xl tracking-widest animate-scale-in"
+              className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none"
+              style={{ zIndex: 30 }}
+            >
+              <div
+                className="font-display font-black tracking-widest"
+                style={{
+                  fontSize: "clamp(3rem, 10vw, 6rem)",
+                  color: goalScorer === 1 ? P1_COLOR : P2_COLOR,
+                  textShadow:
+                    goalScorer === 1
+                      ? `0 0 20px ${P1_COLOR}, 0 0 40px ${P1_COLOR}, 0 0 80px rgba(255,58,45,0.4), 0 4px 12px rgba(0,0,0,0.8)`
+                      : `0 0 20px ${P2_COLOR}, 0 0 40px ${P2_COLOR}, 0 0 80px rgba(61,127,255,0.4), 0 4px 12px rgba(0,0,0,0.8)`,
+                  animation: `goalPop ${GOAL_CELEBRATE_MS}ms ease-out forwards`,
+                  lineHeight: 1,
+                  letterSpacing: "0.1em",
+                }}
+              >
+                GOAL!
+              </div>
+              <div
+                className="font-display font-bold tracking-widest mt-2"
+                style={{
+                  fontSize: "clamp(1.1rem, 3.5vw, 2rem)",
+                  color: "rgba(255,255,255,0.95)",
+                  textShadow: "0 2px 8px rgba(0,0,0,0.9)",
+                  animation: `scorerSlideUp ${GOAL_CELEBRATE_MS}ms ease-out forwards`,
+                  animationDelay: "80ms",
+                  opacity: 0,
+                }}
+              >
+                {goalMessage} SCORES
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── ROUND OVER OVERLAY ── */}
+        {phase === "roundover" && roundWinner && (
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center gap-6 rounded-lg bg-black/75 backdrop-blur-sm"
+            style={{ zIndex: 40 }}
+          >
+            <div className="flex flex-col items-center gap-2">
+              <p
+                style={{ color: "rgba(255,255,255,0.5)", fontSize: "0.85rem" }}
+                className="font-body tracking-widest"
+              >
+                ROUND {roundNumber} COMPLETE
+              </p>
+              <h2
+                className="font-display font-black text-5xl tracking-tight"
+                style={{
+                  color: roundWinner === 1 ? P1_COLOR : P2_COLOR,
+                  textShadow:
+                    roundWinner === 1
+                      ? "0 0 20px rgba(255,58,45,0.8), 0 0 40px rgba(255,58,45,0.4)"
+                      : "0 0 20px rgba(61,127,255,0.8), 0 0 40px rgba(61,127,255,0.4)",
+                }}
+              >
+                PLAYER {roundWinner} WINS
+              </h2>
+              <p
+                className="font-display text-xl font-bold mt-1"
+                style={{ color: "rgba(255,255,255,0.7)" }}
+              >
+                Round Wins: P1 {roundWins[0]} — P2 {roundWins[1]}
+              </p>
+              <p
+                style={{ color: "rgba(255,255,255,0.4)", fontSize: "0.8rem" }}
+                className="font-body"
+              >
+                First to {ROUNDS_TO_WIN_MATCH} rounds wins the match
+              </p>
+            </div>
+            <Button
+              data-ocid="game.next_round_button"
+              onClick={startNextRound}
+              className="font-display font-black text-lg px-10 py-3 h-auto tracking-widest"
               style={{
-                color: "#ffe000",
-                textShadow:
-                  "0 0 20px rgba(255,220,0,0.9), 0 0 40px rgba(255,220,0,0.5), 0 0 80px rgba(255,220,0,0.3)",
+                background: "oklch(0.85 0.18 195)",
+                color: "#04080f",
+                boxShadow: "0 0 20px oklch(0.85 0.18 195 / 0.5)",
               }}
             >
-              {goalMessage}
-            </div>
+              NEXT ROUND ▶
+            </Button>
           </div>
         )}
 

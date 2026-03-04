@@ -1,35 +1,36 @@
 # Hockey Game
 
 ## Current State
-New project — no existing code.
+A 2-player air hockey game on canvas. Players score goals to reach 7 points, after which a "game over" overlay appears with a winner banner, score submission to a leaderboard, and a "Play Again" button that resets everything from scratch.
+
+There is no concept of rounds -- the game is a single match.
 
 ## Requested Changes (Diff)
 
 ### Add
-- A top-down 2D air hockey game playable in the browser
-- Two-player mode (Player 1: keyboard WASD, Player 2: keyboard arrow keys) on the same machine
-- Game canvas rendered via Canvas API
-- Puck physics: velocity, friction, wall/paddle collisions, goal detection
-- Two paddles (one per player) that can be moved around their respective halves
-- Score tracking: first to 7 goals wins
-- Game states: start screen, active gameplay, goal celebration, game over
-- High score (max score reached) persisted in backend canister
-- Sound effects via Web Audio API (goal, puck hit, wall bounce)
-- Responsive canvas that fits in viewport
+- A **round system**: track round wins per player (e.g. P1 rounds won, P2 rounds won)
+- A **round-end overlay** that appears after someone wins a round (reaches 7 goals). Shows: who won the round, current round score (e.g. "Round 2 — P1: 1  P2: 0"), and a "NEXT ROUND" button
+- Round counter display in the HUD or overlay
+- After clicking "Next Round", reset goal scores to 0 and start a new round immediately
+- After a configurable number of rounds won (e.g. first to win 3 rounds = match winner), show the final "GAME OVER" screen with overall winner
 
 ### Modify
-- N/A (new project)
+- `GamePhase` type: add `"roundover"` phase
+- Game over condition: trigger only when a player has won enough rounds (e.g. first to 3 rounds), not just on goal tally
+- The "Play Again" button resets both goal scores AND round wins
+- HUD: show round wins alongside goal score (e.g. small round indicators)
 
 ### Remove
-- N/A (new project)
+- Nothing removed
 
 ## Implementation Plan
-1. Backend: store and retrieve high scores (player names + score) as a leaderboard
-2. Frontend:
-   - Canvas-based game loop using requestAnimationFrame
-   - Game entities: Puck, Paddle (x2), Goals (x2), Rink
-   - Physics: puck velocity + friction, elastic collisions with paddles and walls
-   - WASD controls for P1 (left half only), Arrow keys for P2 (right half only)
-   - HUD: scoreboard, player labels, win message
-   - Start screen with instructions and leaderboard display
-   - Game over screen with winner announcement and leaderboard
+1. Add `ROUNDS_TO_WIN_MATCH = 3` and `roundWins: [number, number]` to game state
+2. Add `roundNumber` state to React component
+3. Add `"roundover"` to `GamePhase` type
+4. When a player reaches `WINS_TO_WIN` goals, check if their round wins reach `ROUNDS_TO_WIN_MATCH`:
+   - If yes: set phase to `"gameover"` (existing behavior)
+   - If no: increment round wins, set phase to `"roundover"`
+5. Add round-over overlay: show winner of round, round wins tally, "NEXT ROUND" button
+6. `startNextRound()` function: reset goal scores to 0, reset puck/paddles, increment round number, resume game loop
+7. Update HUD canvas drawing to show small round-win indicators (dots or numbers) near the score
+8. Update `resetGame()` to also clear round wins and round number
