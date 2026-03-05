@@ -1,35 +1,27 @@
 # Hockey Game
 
 ## Current State
+3v3 3D hockey game with React Three Fiber. Features: character selection with stats/abilities, possession/shooting/body-checking, AI teammates for non-active skaters, single-player VS CPU mode (Easy/Medium/Hard), round/match system, confetti goal animations, leaderboard.
 
-A top-down 2D air hockey game rendered on a Canvas. Two cartoon player sprites slide around a flat rink drawn from a bird's-eye view. Physics include puck bouncing, elastic collisions, scoring, goal animations (confetti, screen flash, "GOAL!" text), a round system (first to 7 goals wins a round; first to 3 rounds wins the match), a leaderboard, and full keyboard controls (WASD / Arrow keys).
+Each team has 3 skaters controlled (or AI-assisted). There are goal nets on each side but no dedicated goalie -- skaters can block but there is no goalie entity that patrols the crease.
 
 ## Requested Changes (Diff)
 
 ### Add
-- A perspective-transformed ice rink that gives the feeling of standing on the ice -- drawn in 3-point perspective so the ice surface recedes into the distance
-- Ice surface texture details (scratches, sheen) rendered in perspective
-- Player characters drawn as proper upright hockey players (with skates, jerseys, stick) that move along the ice plane
-- Perspective-correct shadows/depth cues under each player
-- Camera-angle feel: spectators sit in the upper portion of the canvas, ice stretches toward a vanishing point
+- A CPU-controlled goalie for each team that actively defends their net
+- The goalie is a separate entity (not one of the 3 skaters) -- it stays near the goal crease and moves laterally to track the puck
+- Goalie mesh: visually distinct from regular skaters (different shape/color accent, goalie pads, blocker visual cue)
+- Goalie movement: patrols along the crease line (z-axis) following the puck's z position, clamped to the crease area (z roughly -2.5 to 2.5, x fixed near the goal line)
+- Goalie does NOT leave the crease -- it only slides left/right
+- Goalie deflects the puck if the puck enters the crease and hits the goalie's bounding area (treat as a wall bounce that sends puck back)
+- In 2P mode: both goalies are CPU-controlled
+- In VS CPU mode: P1 goalie is CPU, P2 goalie is CPU (no player controls a goalie)
+- Goalie speed scales slightly with CPU difficulty when it's the CPU's goalie (P2 side); P1 goalie always moves at medium speed
+- HUD shows a small "GK" indicator on each side
 
 ### Modify
-- Replace flat top-down rink drawing with a perspective-projected rink (still Canvas 2D, using CSS transforms or manual perspective math)
-- Player and puck positions are still stored in 2D "ice coordinates" but projected to screen space for rendering
-- Rink lines (blue lines, center line, face-off circles, goal creases) all drawn in perspective
-- Goal nets rendered as 3D-looking structures in perspective
-- HUD, overlays (goal, round over, game over, start screen) remain unchanged
-- Player sprites updated to front-facing upright hockey player characters instead of top-down pucks
+- GameScene: add two GoalieMesh refs and physics states, integrate goalie movement into useFrame loop
+- Goal detection: puck passing through crease should first be checked against goalie collision before registering as a goal
 
 ### Remove
-- Flat top-down rink rendering
-
-## Implementation Plan
-
-1. Create a `project3D` utility that converts ice-plane (x, y) coordinates to screen (sx, sy) using a perspective transform with a defined vanishing point and horizon line
-2. Rewrite `drawRink` to use projected coordinates for all lines, arcs (approximated as polylines in perspective), and goal nets
-3. Rewrite `drawPaddle` / player rendering to draw an upright hockey character sprite at projected position, sized by depth (farther = smaller)
-4. Rewrite `drawPuck` to draw the puck in perspective (elliptical, flattened on ice plane)
-5. Adjust all collision/physics to continue working in flat 2D ice coordinates -- perspective is only a rendering layer
-6. Generate new upright-facing player sprites (P1 red jersey, P2 blue jersey, both holding hockey sticks)
-7. Keep all game logic, scoring, HUD overlays, and leaderboard untouched
+- Nothing removed
